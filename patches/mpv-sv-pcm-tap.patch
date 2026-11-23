@@ -1,14 +1,14 @@
-From e3719e74c978ec56e7721381792dd4b41e8c1eec Mon Sep 17 00:00:00 2001
+From f57f64cc01a4d216690b52aa539ff87c00b832db Mon Sep 17 00:00:00 2001
 From: SuperViewer <noreply@superviewer.invalid>
 Date: Mon, 23 Nov 2026 07:25:09 +0000
 Subject: [PATCH] audio/out: add SuperViewer PCM tap for the visualizer
 
 ---
  audio/out/ao.c         |   3 +
- audio/out/sv_pcm_tap.c | 149 +++++++++++++++++++++++++++++++++++++++++
- audio/out/sv_pcm_tap.h |  21 ++++++
+ audio/out/sv_pcm_tap.c | 175 +++++++++++++++++++++++++++++++++++++++++
+ audio/out/sv_pcm_tap.h |  21 +++++
  meson.build            |   1 +
- 4 files changed, 174 insertions(+)
+ 4 files changed, 200 insertions(+)
  create mode 100644 audio/out/sv_pcm_tap.c
  create mode 100644 audio/out/sv_pcm_tap.h
 
@@ -35,10 +35,10 @@ index 4e5e9e3..36f6fce 100644
  static int get_conv_type(struct ao_convert_fmt *fmt)
 diff --git a/audio/out/sv_pcm_tap.c b/audio/out/sv_pcm_tap.c
 new file mode 100644
-index 0000000..226b058
+index 0000000..9a79bf7
 --- /dev/null
 +++ b/audio/out/sv_pcm_tap.c
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,175 @@
 +/*
 + * SuperViewer PCM tap: a copy of the post-filter audio that the audio
 + * output is about to play, for SuperViewer's visualizer (projectM).
@@ -46,14 +46,14 @@ index 0000000..226b058
 + * Why here: ao_post_process_data() is the last stop before the device,
 + * after every filter (including lavfi-complex, so headphone/HRIR output
 + * is what gets tapped). It runs on the audio thread, so the writer never
-+ * waits: it uses trylock and drops a chunk if the reader holds the lock.
++ * waits: it only tries the lock and drops a chunk if the reader holds it.
 + *
 + * The ring holds stereo float frames (other layouts are folded to
 + * stereo, which is all projectM takes). A monotonic frame counter lets
 + * the reader take every frame exactly once, with no overlap, by keeping
 + * its own cursor.
 + *
-+ * The two reader functions are exported from libmpv (MPV_EXPORT) so the
++ * The two reader functions are exported from libmpv (SV_PCM_TAP_EXPORT) so the
 + * app's native visualizer can call them directly in-process; they are
 + * not part of the mpv client API.
 + *
@@ -69,18 +69,44 @@ index 0000000..226b058
 +#include <stdint.h>
 +#include <string.h>
 +
-+#include <mpv/client.h>
-+
 +#include "audio/format.h"
 +#include "audio/out/ao.h"
 +#include "audio/out/internal.h"
 +#include "audio/out/sv_pcm_tap.h"
-+#include "osdep/threads.h"
++
++// Export the reader functions from libmpv. Defined here rather than taken
++// from the client API header, whose path differs between mpv versions
++// (include/mpv/client.h now, libmpv/client.h before).
++#if defined(_WIN32) || defined(__CYGWIN__)
++#define SV_PCM_TAP_EXPORT __declspec(dllexport)
++#else
++#define SV_PCM_TAP_EXPORT __attribute__((visibility("default")))
++#endif
 +
 +#define RING_FRAMES 65536        // power of two; ~1.4 s at 48 kHz
 +#define SCRATCH_FRAMES 16384     // largest chunk taken in one write
 +
-+static mp_static_mutex lock = MP_STATIC_MUTEX_INITIALIZER;
++// A tiny C11 spinlock instead of mpv's own lock helpers: those changed
++// between mpv versions (pthread wrappers before 0.37, mp_mutex after), and
++// this file must build on both. The writer only ever *tries* the lock; the
++// reader holds it for one short copy.
++static atomic_flag lock = ATOMIC_FLAG_INIT;
++
++static bool lock_try(void)
++{
++    return !atomic_flag_test_and_set_explicit(&lock, memory_order_acquire);
++}
++
++static void lock_wait(void)
++{
++    while (!lock_try())
++        ;   // the writer holds it only for one chunk copy
++}
++
++static void lock_release(void)
++{
++    atomic_flag_clear_explicit(&lock, memory_order_release);
++}
 +static atomic_bool enabled;
 +static float ring[RING_FRAMES * 2];
 +static float scratch[SCRATCH_FRAMES * 2];
@@ -136,7 +162,7 @@ index 0000000..226b058
 +
 +    // Never wait on the audio thread: drop this chunk if the reader holds
 +    // the lock (it holds it only for one copy).
-+    if (mp_mutex_trylock(&lock) != 0)
++    if (!lock_try())
 +        return;
 +    if (rate != ao->samplerate) {
 +        rate = ao->samplerate;
@@ -148,11 +174,11 @@ index 0000000..226b058
 +        ring[at + 1] = scratch[i * 2 + 1];
 +    }
 +    total += n;
-+    mp_mutex_unlock(&lock);
++    lock_release();
 +}
 +
 +// Turn the tap on or off. Off costs the audio thread one atomic load.
-+MPV_EXPORT void sv_pcm_tap_enable(int on)
++SV_PCM_TAP_EXPORT void sv_pcm_tap_enable(int on)
 +{
 +    atomic_store(&enabled, on != 0);
 +}
@@ -162,12 +188,12 @@ index 0000000..226b058
 +// Updates *cursor and *out_rate. Returns the number of frames copied.
 +// Start with *cursor = 0; a cursor ahead of the writer (after a rate
 +// change reset) is moved back to the writer.
-+MPV_EXPORT int sv_pcm_tap_read(float *dst, int max_frames, uint64_t *cursor,
++SV_PCM_TAP_EXPORT int sv_pcm_tap_read(float *dst, int max_frames, uint64_t *cursor,
 +                               int *out_rate)
 +{
 +    if (!dst || max_frames <= 0 || !cursor)
 +        return 0;
-+    mp_mutex_lock(&lock);
++    lock_wait();
 +    uint64_t end = total;
 +    uint64_t from = *cursor > end ? end : *cursor;
 +    uint64_t avail = end - from;
@@ -185,7 +211,7 @@ index 0000000..226b058
 +    *cursor = end;
 +    if (out_rate)
 +        *out_rate = rate;
-+    mp_mutex_unlock(&lock);
++    lock_release();
 +    return (int)avail;
 +}
 diff --git a/audio/out/sv_pcm_tap.h b/audio/out/sv_pcm_tap.h
