@@ -5,10 +5,10 @@ Subject: [PATCH] audio/out: add SuperViewer PCM tap for the visualizer
 
 ---
  audio/out/ao.c         |   3 +
- audio/out/sv_pcm_tap.c | 175 +++++++++++++++++++++++++++++++++++++++++
+ audio/out/sv_pcm_tap.c | 178 +++++++++++++++++++++++++++++++++++++++++
  audio/out/sv_pcm_tap.h |  21 +++++
  meson.build            |   1 +
- 4 files changed, 200 insertions(+)
+ 4 files changed, 203 insertions(+)
  create mode 100644 audio/out/sv_pcm_tap.c
  create mode 100644 audio/out/sv_pcm_tap.h
 
@@ -38,7 +38,7 @@ new file mode 100644
 index 0000000..9a79bf7
 --- /dev/null
 +++ b/audio/out/sv_pcm_tap.c
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,178 @@
 +/*
 + * SuperViewer PCM tap: a copy of the post-filter audio that the audio
 + * output is about to play, for SuperViewer's visualizer (projectM).
@@ -65,7 +65,6 @@ index 0000000..9a79bf7
 + * version 2.1 of the License, or (at your option) any later version.
 + */
 +#include <math.h>
-+#include <stdatomic.h>
 +#include <stdint.h>
 +#include <string.h>
 +
@@ -86,15 +85,19 @@ index 0000000..9a79bf7
 +#define RING_FRAMES 65536        // power of two; ~1.4 s at 48 kHz
 +#define SCRATCH_FRAMES 16384     // largest chunk taken in one write
 +
-+// A tiny C11 spinlock instead of mpv's own lock helpers: those changed
++// A tiny spinlock instead of mpv's own lock helpers: those changed
 +// between mpv versions (pthread wrappers before 0.37, mp_mutex after), and
 +// this file must build on both. The writer only ever *tries* the lock; the
 +// reader holds it for one short copy.
-+static atomic_flag lock = ATOMIC_FLAG_INIT;
++// Uses the GCC/clang __atomic builtins rather than <stdatomic.h>: mpv 0.36's
++// osdep/atomic.h (pulled in via ao.h) defines its own atomic_* typedefs when
++// mpv's build did not detect stdatomic, and those clash with the real header
++// (seen on the iOS simulator build).
++static unsigned char lock;
 +
 +static bool lock_try(void)
 +{
-+    return !atomic_flag_test_and_set_explicit(&lock, memory_order_acquire);
++    return !__atomic_test_and_set(&lock, __ATOMIC_ACQUIRE);
 +}
 +
 +static void lock_wait(void)
@@ -105,9 +108,9 @@ index 0000000..9a79bf7
 +
 +static void lock_release(void)
 +{
-+    atomic_flag_clear_explicit(&lock, memory_order_release);
++    __atomic_clear(&lock, __ATOMIC_RELEASE);
 +}
-+static atomic_bool enabled;
++static int enabled;             // 0/1, accessed only via __atomic builtins
 +static float ring[RING_FRAMES * 2];
 +static float scratch[SCRATCH_FRAMES * 2];
 +static uint64_t total;           // frames ever written (monotonic)
@@ -132,7 +135,7 @@ index 0000000..9a79bf7
 +
 +void sv_pcm_tap_write(struct ao *ao, void **data, int num_samples)
 +{
-+    if (!atomic_load_explicit(&enabled, memory_order_relaxed))
++    if (!__atomic_load_n(&enabled, __ATOMIC_RELAXED))
 +        return;
 +    // Passthrough (AC3, DTS...) is coded data, not samples.
 +    if (!ao || !data || num_samples <= 0 || !af_fmt_is_pcm(ao->format))
@@ -180,7 +183,7 @@ index 0000000..9a79bf7
 +// Turn the tap on or off. Off costs the audio thread one atomic load.
 +SV_PCM_TAP_EXPORT void sv_pcm_tap_enable(int on)
 +{
-+    atomic_store(&enabled, on != 0);
++    __atomic_store_n(&enabled, on != 0, __ATOMIC_SEQ_CST);
 +}
 +
 +// Copy the stereo frames written since *cursor (at most max_frames, the
