@@ -48,6 +48,8 @@ let
     cd $src
     patch -p1 <${../../../patches/mpv-fix-missing-objc.patch}
     patch -p1 <${../../../patches/mpv-audiounit-shared-session.patch}
+    # SuperViewer: PCM tap for the visualizer (see the patch header).
+    patch -p1 <${../../../patches/mpv-sv-pcm-tap.patch}
     if [ "${variant}" == "${variants.audio}" ]; then
       patch -p1 <${../../../patches/mpv-remove-libass.patch}
     fi

@@ -272,6 +272,13 @@ audio_full_options = [
     # filters
     '--enable-filter=overlay',
     '--enable-filter=equalizer',
+    # SuperViewer: filters HRIR's lavfi-complex graph uses (lib/hrir/).
+    '--enable-filter=headphone',
+    '--enable-filter=pan',
+    '--enable-filter=amovie',
+    '--enable-filter=anull',
+    '--enable-filter=aresample',
+    '--enable-filter=aformat',
 
     # TODO: `media_kit` checks the presence of the h264 decoder to determine if
     # `ffmpeg` is an audio or video variant, so we disable it for the audio

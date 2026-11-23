@@ -1,0 +1,232 @@
+From e3719e74c978ec56e7721381792dd4b41e8c1eec Mon Sep 17 00:00:00 2001
+From: SuperViewer <noreply@superviewer.invalid>
+Date: Mon, 23 Nov 2026 07:25:09 +0000
+Subject: [PATCH] audio/out: add SuperViewer PCM tap for the visualizer
+
+---
+ audio/out/ao.c         |   3 +
+ audio/out/sv_pcm_tap.c | 149 +++++++++++++++++++++++++++++++++++++++++
+ audio/out/sv_pcm_tap.h |  21 ++++++
+ meson.build            |   1 +
+ 4 files changed, 174 insertions(+)
+ create mode 100644 audio/out/sv_pcm_tap.c
+ create mode 100644 audio/out/sv_pcm_tap.h
+
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..36f6fce 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -34,6 +34,7 @@
+ #include "common/msg.h"
+ #include "common/common.h"
+ #include "common/global.h"
++#include "audio/out/sv_pcm_tap.h"
+ 
+ extern const struct ao_driver audio_out_oss;
+ extern const struct ao_driver audio_out_audiotrack;
+@@ -659,6 +660,8 @@ void ao_post_process_data(struct ao *ao, void **data, int num_samples)
+     int plane_samples = num_samples * (planar ? 1: ao->channels.num);
+     for (int n = 0; n < planes; n++)
+         process_plane(ao, data[n], plane_samples);
++    // SuperViewer: copy the final samples for the visualizer.
++    sv_pcm_tap_write(ao, data, num_samples);
+ }
+ 
+ static int get_conv_type(struct ao_convert_fmt *fmt)
+diff --git a/audio/out/sv_pcm_tap.c b/audio/out/sv_pcm_tap.c
+new file mode 100644
+index 0000000..226b058
+--- /dev/null
++++ b/audio/out/sv_pcm_tap.c
+@@ -0,0 +1,149 @@
++/*
++ * SuperViewer PCM tap: a copy of the post-filter audio that the audio
++ * output is about to play, for SuperViewer's visualizer (projectM).
++ *
++ * Why here: ao_post_process_data() is the last stop before the device,
++ * after every filter (including lavfi-complex, so headphone/HRIR output
++ * is what gets tapped). It runs on the audio thread, so the writer never
++ * waits: it uses trylock and drops a chunk if the reader holds the lock.
++ *
++ * The ring holds stereo float frames (other layouts are folded to
++ * stereo, which is all projectM takes). A monotonic frame counter lets
++ * the reader take every frame exactly once, with no overlap, by keeping
++ * its own cursor.
++ *
++ * The two reader functions are exported from libmpv (MPV_EXPORT) so the
++ * app's native visualizer can call them directly in-process; they are
++ * not part of the mpv client API.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#include <math.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <mpv/client.h>
++
++#include "audio/format.h"
++#include "audio/out/ao.h"
++#include "audio/out/internal.h"
++#include "audio/out/sv_pcm_tap.h"
++#include "osdep/threads.h"
++
++#define RING_FRAMES 65536        // power of two; ~1.4 s at 48 kHz
++#define SCRATCH_FRAMES 16384     // largest chunk taken in one write
++
++static mp_static_mutex lock = MP_STATIC_MUTEX_INITIALIZER;
++static atomic_bool enabled;
++static float ring[RING_FRAMES * 2];
++static float scratch[SCRATCH_FRAMES * 2];
++static uint64_t total;           // frames ever written (monotonic)
++static int rate;
++
++// One sample of any PCM format as float in [-1, 1].
++static float sample_at(int fmt, void **data, bool planar, int ch, int chans,
++                       int i)
++{
++    int plane = planar ? ch : 0;
++    int idx = planar ? i : i * chans + ch;
++    switch (af_fmt_from_planar(fmt)) {
++    case AF_FORMAT_U8:     return (((uint8_t *)data[plane])[idx] - 128) / 128.0f;
++    case AF_FORMAT_S16:    return ((int16_t *)data[plane])[idx] / 32768.0f;
++    case AF_FORMAT_S32:    return ((int32_t *)data[plane])[idx] / 2147483648.0f;
++    case AF_FORMAT_S64:    return ((int64_t *)data[plane])[idx] / 9223372036854775808.0f;
++    case AF_FORMAT_FLOAT:  return ((float *)data[plane])[idx];
++    case AF_FORMAT_DOUBLE: return (float)((double *)data[plane])[idx];
++    default:               return 0.0f;
++    }
++}
++
++void sv_pcm_tap_write(struct ao *ao, void **data, int num_samples)
++{
++    if (!atomic_load_explicit(&enabled, memory_order_relaxed))
++        return;
++    // Passthrough (AC3, DTS...) is coded data, not samples.
++    if (!ao || !data || num_samples <= 0 || !af_fmt_is_pcm(ao->format))
++        return;
++    int chans = ao->channels.num;
++    if (chans <= 0)
++        return;
++    int n = num_samples < SCRATCH_FRAMES ? num_samples : SCRATCH_FRAMES;
++    bool planar = af_fmt_is_planar(ao->format);
++
++    // Fold to stereo: mono goes to both sides; for more channels, even
++    // channels go left and odd go right (FL/FR, then C/LFE, SL/SR...),
++    // averaged. Good enough for a visualizer, cheap on the audio thread.
++    for (int i = 0; i < n; i++) {
++        float l = 0, r = 0;
++        int nl = 0, nr = 0;
++        for (int c = 0; c < chans; c++) {
++            float s = sample_at(ao->format, data, planar, c, chans, i);
++            if (!isfinite(s))
++                s = 0;
++            if (chans == 1 || c % 2 == 0) { l += s; nl++; }
++            if (chans == 1 || c % 2 == 1) { r += s; nr++; }
++        }
++        scratch[i * 2] = nl ? l / nl : 0;
++        scratch[i * 2 + 1] = nr ? r / nr : 0;
++    }
++
++    // Never wait on the audio thread: drop this chunk if the reader holds
++    // the lock (it holds it only for one copy).
++    if (mp_mutex_trylock(&lock) != 0)
++        return;
++    if (rate != ao->samplerate) {
++        rate = ao->samplerate;
++        total = 0;   // new rate: older frames would be read at the wrong speed
++    }
++    for (int i = 0; i < n; i++) {
++        size_t at = (size_t)((total + i) & (RING_FRAMES - 1)) * 2;
++        ring[at] = scratch[i * 2];
++        ring[at + 1] = scratch[i * 2 + 1];
++    }
++    total += n;
++    mp_mutex_unlock(&lock);
++}
++
++// Turn the tap on or off. Off costs the audio thread one atomic load.
++MPV_EXPORT void sv_pcm_tap_enable(int on)
++{
++    atomic_store(&enabled, on != 0);
++}
++
++// Copy the stereo frames written since *cursor (at most max_frames, the
++// newest ones if more are waiting) into dst as interleaved L/R floats.
++// Updates *cursor and *out_rate. Returns the number of frames copied.
++// Start with *cursor = 0; a cursor ahead of the writer (after a rate
++// change reset) is moved back to the writer.
++MPV_EXPORT int sv_pcm_tap_read(float *dst, int max_frames, uint64_t *cursor,
++                               int *out_rate)
++{
++    if (!dst || max_frames <= 0 || !cursor)
++        return 0;
++    mp_mutex_lock(&lock);
++    uint64_t end = total;
++    uint64_t from = *cursor > end ? end : *cursor;
++    uint64_t avail = end - from;
++    uint64_t keep = (uint64_t)max_frames < RING_FRAMES ? (uint64_t)max_frames
++                                                       : RING_FRAMES;
++    if (avail > keep) {
++        from = end - keep;   // too far behind: skip to the newest frames
++        avail = keep;
++    }
++    for (uint64_t i = 0; i < avail; i++) {
++        size_t at = (size_t)((from + i) & (RING_FRAMES - 1)) * 2;
++        dst[i * 2] = ring[at];
++        dst[i * 2 + 1] = ring[at + 1];
++    }
++    *cursor = end;
++    if (out_rate)
++        *out_rate = rate;
++    mp_mutex_unlock(&lock);
++    return (int)avail;
++}
+diff --git a/audio/out/sv_pcm_tap.h b/audio/out/sv_pcm_tap.h
+new file mode 100644
+index 0000000..66d7f1b
+--- /dev/null
++++ b/audio/out/sv_pcm_tap.h
+@@ -0,0 +1,21 @@
++/*
++ * SuperViewer PCM tap: a copy of the post-filter audio that the audio
++ * output is about to play, for SuperViewer's visualizer (projectM).
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#ifndef MP_AUDIO_OUT_SV_PCM_TAP_H_
++#define MP_AUDIO_OUT_SV_PCM_TAP_H_
++
++struct ao;
++
++// Called from ao_post_process_data() on every chunk the output plays.
++// Returns at once while no reader has enabled the tap.
++void sv_pcm_tap_write(struct ao *ao, void **data, int num_samples);
++
++#endif
+diff --git a/meson.build b/meson.build
+index 656d156..9bb33e2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -73,6 +73,7 @@ sources = files(
+     'audio/fmt-conversion.c',
+     'audio/format.c',
+     'audio/out/ao.c',
++    'audio/out/sv_pcm_tap.c',
+     'audio/out/ao_lavc.c',
+     'audio/out/ao_null.c',
+     'audio/out/ao_pcm.c',
+-- 
+2.43.0
+
