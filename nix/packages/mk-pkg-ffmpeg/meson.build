@@ -279,6 +279,10 @@ audio_full_options = [
     '--enable-filter=anull',
     '--enable-filter=aresample',
     '--enable-filter=aformat',
+    '--enable-filter=join',
+    '--enable-filter=acrossover',
+    # video pass-through when the graph also carries [vid1] (hrir_graph.dart)
+    '--enable-filter=null',
 
     # TODO: `media_kit` checks the presence of the h264 decoder to determine if
     # `ffmpeg` is an audio or video variant, so we disable it for the audio
