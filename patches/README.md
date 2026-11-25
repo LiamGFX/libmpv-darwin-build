@@ -12,6 +12,7 @@ Pinned: mpv 0.41.0, FFmpeg 8.0.3, libplacebo 7.360.1.
 |---|---|---|---|
 | `mpv-sv-pcm-tap.patch` | SuperViewer | Copies the final post-filter PCM (after HRIR) for the visualizer; new file `audio/out/sv_pcm_tap.c`, one hook in `ao_post_process_data()`. | Never (ours). |
 | `mpv-audiounit-shared-session.patch` | Inherited (fork) | Reference-counts the iOS AVAudioSession so one player's uninit doesn't silence another; adds `--audiounit-skip-session-management`. | Upstream stops deactivating the session in `uninit`. |
+| `mpv-sv-avsbuf.patch` | SuperViewer | `--vo=avsbuf`: AVSampleBufferDisplayLayer video output for iOS/tvOS (PiP, background, 10-bit/HDR). New file `video/out/vo_avsbuf.m`, one `vo.c` entry, one meson option and block. | Never (ours). |
 | `mpv-fix-missing-objc.patch` | Inherited (fork) | Adds the objc language where `.m` sources are added; 0.41.0 only does it when it detects a macOS SDK. | Upstream adds objc for iOS cross builds. |
 
 ## FFmpeg

@@ -51,6 +51,8 @@ let
     patch -p1 <${../../../patches/mpv-audiounit-shared-session.patch}
     # SuperViewer: PCM tap for the visualizer (see the patch header).
     patch -p1 <${../../../patches/mpv-sv-pcm-tap.patch}
+    # SuperViewer: AVSampleBufferDisplayLayer video output (PiP, background).
+    patch -p1 <${../../../patches/mpv-sv-avsbuf.patch}
     # The audio-only variant (and its mpv-remove-libass.patch) was dropped
     # with the move to mpv 0.41.0; see patches/README.md.
     cd -
@@ -171,6 +173,7 @@ pkgs.stdenvNoCC.mkDerivation {
       -Dios-gl=disabled `# iOS OpenGL ES hardware decoding interop support`
       -Dvideotoolbox-gl=disabled `# Videotoolbox with OpenGL`
       -Dvideotoolbox-pl=disabled `# Videotoolbox with libplacebo (needs its Vulkan)`
+      -Davsbuf=disabled `# AVSampleBufferDisplayLayer video output (SuperViewer patch)`
 
       `# macOS features`
       `# (the macos-10-* SDK feature options were removed in mpv 0.41.0;`
@@ -230,6 +233,9 @@ pkgs.stdenvNoCC.mkDerivation {
     IOS_VIDEO_OPTIONS=(
       `# hwaccel features`
       -Dios-gl=enabled `# iOS OpenGL ES hardware decoding interop support`
+
+      `# video output features`
+      -Davsbuf=enabled `# AVSampleBufferDisplayLayer video output (SuperViewer patch)`
     )
 
     OPTIONS=("''${DISABLE_ALL_OPTIONS[@]}")

@@ -1,0 +1,704 @@
+From: SuperViewer <noreply@superviewer.invalid>
+Subject: [PATCH] video/out: add avsbuf, an AVSampleBufferDisplayLayer VO (iOS/tvOS)
+
+Shows frames on an app-supplied AVSampleBufferDisplayLayer (--vo=avsbuf
+--wid=<layer pointer>), so video keeps playing in Picture in Picture and
+in the background, where the OpenGL ES render API cannot run. See the
+header of video/out/vo_avsbuf.m for the design. LGPL-2.1+.
+
+diff --git a/meson.build b/meson.build
+index 8c9e233..24b5e41 100644
+--- a/meson.build
++++ b/meson.build
+@@ -818,6 +818,20 @@ if features['audiounit']
+     sources += files('audio/out/ao_audiounit.m')
+ endif
+ 
++# SuperViewer: AVSampleBufferDisplayLayer video output. UIKit only exists on
++# iOS/tvOS, so this turns itself off for macOS builds.
++avsbuf_opt = get_option('avsbuf').require(darwin)
++avsbuf = dependency('appleframeworks',
++                    modules: ['Foundation', 'UIKit', 'QuartzCore', 'AVFoundation',
++                              'CoreMedia', 'CoreVideo'],
++                    required: avsbuf_opt)
++features += {'avsbuf': avsbuf.found()}
++if features['avsbuf']
++    add_languages('objc')
++    dependencies += avsbuf
++    sources += files('video/out/vo_avsbuf.m')
++endif
++
+ avfoundation = dependency('appleframeworks', modules: ['CoreMedia', 'AVFoundation'],
+                           required: get_option('avfoundation'))
+ features += {'avfoundation': avfoundation.found()}
+diff --git a/meson.options b/meson.options
+index 52782f7..a68ecd1 100644
+--- a/meson.options
++++ b/meson.options
+@@ -41,6 +41,7 @@ option('zlib', type: 'feature', value: 'auto', description: 'zlib')
+ # audio output features
+ option('alsa', type: 'feature', value: 'auto', description: 'ALSA audio output')
+ option('audiounit', type: 'feature', value: 'auto', description: 'AudioUnit output (iOS)')
++option('avsbuf', type: 'feature', value: 'auto', description: 'AVSampleBufferDisplayLayer video output (iOS/tvOS, SuperViewer)')
+ option('coreaudio', type: 'feature', value: 'auto', description: 'CoreAudio audio output')
+ option('avfoundation', type: 'feature', value: 'auto', description: 'AVFoundation audio output')
+ option('jack', type: 'feature', value: 'auto', description: 'JACK audio output')
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..f8f856c 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -53,6 +53,7 @@ extern const struct vo_driver video_out_xv;
+ extern const struct vo_driver video_out_gpu;
+ extern const struct vo_driver video_out_gpu_next;
+ extern const struct vo_driver video_out_libmpv;
++extern const struct vo_driver video_out_avsbuf;
+ extern const struct vo_driver video_out_null;
+ extern const struct vo_driver video_out_image;
+ extern const struct vo_driver video_out_lavc;
+@@ -101,6 +102,11 @@ static const struct vo_driver *const video_out_drivers[] =
+     &video_out_x11,
+ #endif
+     &video_out_libmpv,
++#if HAVE_AVSBUF
++    // SuperViewer: must be asked for (--vo=avsbuf with --wid); never autoprobed
++    // in practice, since it fails without a layer.
++    &video_out_avsbuf,
++#endif
+     &video_out_null,
+ 
+     // should not be auto-selected
+diff --git a/video/out/vo_avsbuf.m b/video/out/vo_avsbuf.m
+new file mode 100644
+index 0000000..9c220e4
+--- /dev/null
++++ b/video/out/vo_avsbuf.m
+@@ -0,0 +1,629 @@
++/*
++ * avsbuf video output: shows frames on an AVSampleBufferDisplayLayer
++ * (iOS / tvOS), written for SuperViewer.
++ *
++ * Why: the libmpv OpenGL ES render path can't run while the app is in the
++ * background, so Picture in Picture (which needs exactly that) is impossible
++ * with it. Here VideoToolbox frames go to the layer as they are: no GPU work
++ * of our own, 10-bit / HDR frames stay 10-bit, and AVKit can show the same
++ * layer in PiP.
++ *
++ * The app creates the layer and passes it with --wid=<AVSampleBufferDisplayLayer
++ * pointer>, keeping its own reference for as long as this VO may run. mpv only
++ * borrows it (retained here between preinit and uninit).
++ *
++ * Design notes (see patches/README.md in the build repo):
++ * - Timing: each frame is stamped with its display time on the host clock
++ *   (CACurrentMediaTime, the layer's default clock when it has no
++ *   controlTimebase). mpv's vo_frame.pts is converted by its distance from
++ *   "now", so no assumption is made about mpv's timer offset. Same approach as
++ *   VLC's VLCSampleBufferDisplay.m (LGPL-2.1+).
++ * - Recovery: iOS can revoke the layer's decoder resources (e.g. in the
++ *   background). A failed layer that reports requiresFlushToResumeDecoding is
++ *   flushed, on that notification and when the app becomes active; frames are
++ *   not enqueued while it is failed.
++ * - Subtitles / OSD: drawn by mpv into a BGRA image and shown on a sublayer,
++ *   only when the OSD actually changed; video frames are never re-rendered.
++ * - Software-decoded frames (NV12 / P010) are copied into IOSurface-backed
++ *   CVPixelBuffers from a pool; mpv converts any other format to these.
++ *
++ * Not handled yet: video rotation metadata (frames show unrotated).
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#import <AVFoundation/AVFoundation.h>
++#import <CoreMedia/CoreMedia.h>
++#import <CoreVideo/CoreVideo.h>
++#import <QuartzCore/QuartzCore.h>
++#import <UIKit/UIKit.h>
++
++#include <stdatomic.h>
++
++#include <libavutil/hwcontext.h>
++
++#include "common/msg.h"
++#include "options/options.h"
++#include "osdep/timer.h"
++#include "sub/draw_bmp.h"
++#include "sub/osd.h"
++#include "video/hwdec.h"
++#include "video/mp_image.h"
++#include "vo.h"
++
++#include <pthread.h>
++
++// Main-thread callbacks (layer bounds KVO, app/layer notifications) reach the
++// VO through this object. uninit() clears `vo` under the lock, so a callback
++// already in flight can't touch a freed VO. (This file is built without ARC.)
++@interface AVSBufObserver : NSObject {
++@public
++    pthread_mutex_t lock;
++    struct vo *vo;
++}
++@end
++
++static void recover_layer(struct vo *vo);
++static void update_layer_size(struct vo *vo, CGRect bounds, CGFloat scale);
++
++@implementation AVSBufObserver
++- (instancetype)initWithVO:(struct vo *)v
++{
++    if ((self = [super init])) {
++        pthread_mutex_init(&lock, NULL);
++        vo = v;
++    }
++    return self;
++}
++- (void)dealloc
++{
++    pthread_mutex_destroy(&lock);
++    [super dealloc];
++}
++- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
++                        change:(NSDictionary *)change context:(void *)context
++{
++    CALayer *layer = object;
++    pthread_mutex_lock(&lock);
++    if (vo)
++        update_layer_size(vo, layer.bounds, layer.contentsScale);
++    pthread_mutex_unlock(&lock);
++}
++- (void)recover:(NSNotification *)note
++{
++    pthread_mutex_lock(&lock);
++    if (vo)
++        recover_layer(vo);
++    pthread_mutex_unlock(&lock);
++}
++- (void)detach
++{
++    pthread_mutex_lock(&lock);
++    vo = NULL;
++    pthread_mutex_unlock(&lock);
++}
++@end
++
++struct priv {
++    // Owned (+1) between preinit and uninit.
++    AVSampleBufferDisplayLayer *layer;
++    CALayer *osd_layer;                 // sublayer of `layer`, main thread only (+1)
++    AVSBufObserver *observer;           // +1
++    // VideoToolbox device for --hwdec=videotoolbox (zero-copy frames).
++    struct mp_hwdec_ctx hwctx;
++
++    struct mp_image_params params;
++    CMVideoFormatDescriptionRef fmt_desc; // cached, rebuilt when it stops matching
++    CVPixelBufferPoolRef pool;          // for software frames
++    int pool_fmt, pool_w, pool_h;
++
++    // Layer size in pixels, written on the main thread (KVO on bounds) and
++    // read on the VO thread.
++    _Atomic int layer_w, layer_h;
++
++    // OSD state (VO thread).
++    struct mp_draw_sub_cache *osd_cache;
++    struct mp_image *osd_image;         // BGRA, premultiplied
++    int64_t osd_change_id;
++    struct mp_osd_res osd_res;
++    bool osd_visible;
++    double last_pts;                    // video pts of the last frame, for OSD timing
++};
++
++// Flush a layer that failed only because its decoder resources were revoked;
++// any other failure is permanent and only logged.
++static void recover_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    @synchronized(layer) {
++        if (layer.status != AVQueuedSampleBufferRenderingStatusFailed)
++            return;
++        if (@available(iOS 14.0, tvOS 14.0, *)) {
++            if (!layer.requiresFlushToResumeDecoding) {
++                MP_ERR(vo, "display layer failed: %s\n",
++                       layer.error.localizedDescription.UTF8String);
++                return;
++            }
++        }
++        MP_VERBOSE(vo, "flushing display layer to resume decoding\n");
++        [layer flush];
++    }
++    // The flush emptied the layer; draw the current frame again.
++    // (Called off the VO thread, so use the thread-safe request.)
++    vo_redraw(vo);
++}
++
++static void update_layer_size(struct vo *vo, CGRect bounds, CGFloat scale)
++{
++    struct priv *p = vo->priv;
++    atomic_store(&p->layer_w, (int)lround(bounds.size.width * scale));
++    atomic_store(&p->layer_h, (int)lround(bounds.size.height * scale));
++    vo_wakeup(vo);
++}
++
++// Runs on the VO thread: pick up a size change from the main thread.
++static void check_resize(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int w = atomic_load(&p->layer_w), h = atomic_load(&p->layer_h);
++    if (w > 0 && h > 0 && (w != vo->dwidth || h != vo->dheight)) {
++        vo->dwidth = w;
++        vo->dheight = h;
++        vo->want_redraw = true;
++    }
++}
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!vo->opts->WinID || vo->opts->WinID == -1) {
++        MP_ERR(vo, "needs --wid set to an AVSampleBufferDisplayLayer pointer\n");
++        return -1;
++    }
++    id obj = (id)(void *)(intptr_t)vo->opts->WinID;
++    // isKindOfClass is safe off the main thread; nothing else here touches
++    // the layer's UIKit-side state synchronously. (No dispatch_sync: the main
++    // thread may itself be waiting on mpv, which would deadlock.)
++    if (![obj isKindOfClass:[AVSampleBufferDisplayLayer class]]) {
++        MP_ERR(vo, "--wid is not an AVSampleBufferDisplayLayer\n");
++        return -1;
++    }
++    p->layer = [obj retain];
++    p->osd_layer = [[CALayer alloc] init];
++    p->observer = [[AVSBufObserver alloc] initWithVO:vo];
++    p->osd_cache = mp_draw_sub_alloc(p, vo->global);
++    p->last_pts = MP_NOPTS_VALUE;
++
++    // Offer a VideoToolbox device so the decoder hands us CVPixelBuffers
++    // directly (like vo_mediacodec_embed does for MediaCodec). Without it
++    // only --hwdec=videotoolbox-copy / software decoding would work.
++    vo->hwdec_devs = hwdec_devices_create();
++    AVBufferRef *dev = NULL;
++    if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0) >= 0) {
++        p->hwctx = (struct mp_hwdec_ctx){
++            .driver_name = "avsbuf",
++            .av_device_ref = dev,
++            .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
++        };
++        hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++    } else {
++        MP_WARN(vo, "no VideoToolbox device; hardware decoding will copy\n");
++    }
++
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    CALayer *osd = p->osd_layer;
++    AVSBufObserver *observer = p->observer;
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++    [nc addObserver:observer selector:@selector(recover:)
++               name:UIApplicationDidBecomeActiveNotification object:nil];
++    if (@available(iOS 14.0, tvOS 14.0, *)) {
++        [nc addObserver:observer selector:@selector(recover:)
++                   name:AVSampleBufferDisplayLayerRequiresFlushToResumeDecodingDidChangeNotification
++                 object:layer];
++    }
++    // The block keeps its own references (retained here, released inside),
++    // since uninit may run before it.
++    [layer retain]; [osd retain]; [observer retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++        layer.videoGravity = AVLayerVideoGravityResizeAspect;
++        osd.frame = layer.bounds;
++        osd.contentsGravity = kCAGravityResize;
++        osd.contentsScale = layer.contentsScale;
++        [layer addSublayer:osd];
++        // Initial size, then every change (the layer is resized by the app).
++        [layer addObserver:observer forKeyPath:@"bounds" options:0 context:NULL];
++        [observer observeValueForKeyPath:@"bounds" ofObject:layer change:nil context:NULL];
++        [layer release]; [osd release]; [observer release];
++    });
++    return 0;
++}
++
++static int query_format(struct vo *vo, int format)
++{
++    // Hardware frames as-is; software frames copied. mpv's autoconvert turns
++    // other software formats into one of these.
++    return format == IMGFMT_VIDEOTOOLBOX || format == IMGFMT_NV12 ||
++           format == IMGFMT_P010;
++}
++
++static void release_fmt_desc(struct priv *p)
++{
++    if (p->fmt_desc)
++        CFRelease(p->fmt_desc);
++    p->fmt_desc = NULL;
++}
++
++static int reconfig(struct vo *vo, struct mp_image_params *params)
++{
++    struct priv *p = vo->priv;
++    p->params = *params;
++    release_fmt_desc(p);
++    check_resize(vo);
++    return 0;
++}
++
++static CFStringRef cv_matrix(enum pl_color_system sys)
++{
++    switch (sys) {
++    case PL_COLOR_SYSTEM_BT_601:     return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++    case PL_COLOR_SYSTEM_BT_2020_NC: return kCVImageBufferYCbCrMatrix_ITU_R_2020;
++    case PL_COLOR_SYSTEM_SMPTE_240M: return kCVImageBufferYCbCrMatrix_SMPTE_240M_1995;
++    default:                         return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++    }
++}
++
++static CFStringRef cv_primaries(enum pl_color_primaries prim)
++{
++    switch (prim) {
++    case PL_COLOR_PRIM_BT_601_525: return kCVImageBufferColorPrimaries_SMPTE_C;
++    case PL_COLOR_PRIM_BT_601_625: return kCVImageBufferColorPrimaries_EBU_3213;
++    case PL_COLOR_PRIM_BT_2020:    return kCVImageBufferColorPrimaries_ITU_R_2020;
++    case PL_COLOR_PRIM_DISPLAY_P3: return kCVImageBufferColorPrimaries_P3_D65;
++    default:                       return kCVImageBufferColorPrimaries_ITU_R_709_2;
++    }
++}
++
++static CFStringRef cv_transfer(enum pl_color_transfer trc)
++{
++    switch (trc) {
++    case PL_COLOR_TRC_PQ:  return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++    case PL_COLOR_TRC_HLG: return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++    case PL_COLOR_TRC_LINEAR: return kCVImageBufferTransferFunction_Linear;
++    default:               return kCVImageBufferTransferFunction_ITU_R_709_2;
++    }
++}
++
++// Pixel aspect ratio and HDR10 static metadata on every buffer, so the layer
++// scales anamorphic video right and tone-maps HDR with the stream's values.
++// The byte layouts are the big-endian SEI/box layouts CoreVideo expects
++// (same as VLC's attachHDRMetadataFromFormat).
++static void attach_common(struct vo *vo, CVPixelBufferRef buf)
++{
++    struct priv *p = vo->priv;
++    if (p->params.p_w > 0 && p->params.p_h > 0) {
++        NSDictionary *par = @{
++            (__bridge NSString *)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(p->params.p_w),
++            (__bridge NSString *)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(p->params.p_h),
++        };
++        CVBufferSetAttachment(buf, kCVImageBufferPixelAspectRatioKey,
++                              (__bridge CFDictionaryRef)par,
++                              kCVAttachmentMode_ShouldPropagate);
++    }
++
++    const struct pl_hdr_metadata *hdr = &p->params.color.hdr;
++    if (hdr->max_luma > 0) {
++        // SMPTE ST 2086: primaries G, B, R and white point in 0.00002 units,
++        // luminance in 0.0001 cd/m².
++        uint8_t mdcv[24];
++        const struct pl_cie_xy xy[4] = { hdr->prim.green, hdr->prim.blue,
++                                         hdr->prim.red, hdr->prim.white };
++        for (int i = 0; i < 4; i++) {
++            uint16_t x = lrintf(xy[i].x * 50000), y = lrintf(xy[i].y * 50000);
++            mdcv[i * 4 + 0] = x >> 8; mdcv[i * 4 + 1] = x;
++            mdcv[i * 4 + 2] = y >> 8; mdcv[i * 4 + 3] = y;
++        }
++        uint32_t lmax = lrintf(hdr->max_luma * 10000), lmin = lrintf(hdr->min_luma * 10000);
++        for (int i = 0; i < 4; i++) {
++            mdcv[16 + i] = lmax >> (24 - 8 * i);
++            mdcv[20 + i] = lmin >> (24 - 8 * i);
++        }
++        CFDataRef data = CFDataCreate(NULL, mdcv, sizeof(mdcv));
++        CVBufferSetAttachment(buf, kCVImageBufferMasteringDisplayColorVolumeKey,
++                              data, kCVAttachmentMode_ShouldPropagate);
++        CFRelease(data);
++    }
++    if (hdr->max_cll > 0 || hdr->max_fall > 0) {
++        uint16_t cll = lrintf(hdr->max_cll), fall = lrintf(hdr->max_fall);
++        uint8_t clli[4] = { cll >> 8, cll, fall >> 8, fall };
++        CFDataRef data = CFDataCreate(NULL, clli, sizeof(clli));
++        CVBufferSetAttachment(buf, kCVImageBufferContentLightLevelInfoKey,
++                              data, kCVAttachmentMode_ShouldPropagate);
++        CFRelease(data);
++    }
++}
++
++// Copy a software frame into a pooled IOSurface pixel buffer (+1 returned).
++static CVPixelBufferRef upload_sw(struct vo *vo, struct mp_image *img)
++{
++    struct priv *p = vo->priv;
++    if (!p->pool || p->pool_fmt != img->imgfmt || p->pool_w != img->w ||
++        p->pool_h != img->h)
++    {
++        if (p->pool)
++            CVPixelBufferPoolRelease(p->pool);
++        p->pool = NULL;
++        bool full = p->params.repr.levels == PL_COLOR_LEVELS_FULL;
++        OSType cv_fmt = img->imgfmt == IMGFMT_P010
++            ? (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
++                    : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
++            : (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                    : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
++        NSDictionary *attrs = @{
++            (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(cv_fmt),
++            (__bridge NSString *)kCVPixelBufferWidthKey: @(img->w),
++            (__bridge NSString *)kCVPixelBufferHeightKey: @(img->h),
++            // IOSurface backing lets the layer scan the buffer out directly.
++            (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
++        };
++        if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attrs,
++                                    &p->pool) != kCVReturnSuccess)
++        {
++            MP_ERR(vo, "could not create a pixel buffer pool\n");
++            return NULL;
++        }
++        p->pool_fmt = img->imgfmt;
++        p->pool_w = img->w;
++        p->pool_h = img->h;
++    }
++
++    CVPixelBufferRef buf = NULL;
++    if (CVPixelBufferPoolCreatePixelBuffer(NULL, p->pool, &buf) != kCVReturnSuccess)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(buf, 0);
++    for (int n = 0; n < 2; n++) {
++        int bytes = mp_image_plane_w(img, n) * img->fmt.bpp[n] / 8;
++        memcpy_pic(CVPixelBufferGetBaseAddressOfPlane(buf, n), img->planes[n],
++                   bytes, mp_image_plane_h(img, n),
++                   CVPixelBufferGetBytesPerRowOfPlane(buf, n), img->stride[n]);
++    }
++    CVPixelBufferUnlockBaseAddress(buf, 0);
++
++    // Decoder-made VideoToolbox buffers already carry these.
++    CVBufferSetAttachment(buf, kCVImageBufferYCbCrMatrixKey,
++                          cv_matrix(p->params.repr.sys), kCVAttachmentMode_ShouldPropagate);
++    CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
++                          cv_primaries(p->params.color.primaries), kCVAttachmentMode_ShouldPropagate);
++    CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,
++                          cv_transfer(p->params.color.transfer), kCVAttachmentMode_ShouldPropagate);
++    return buf;
++}
++
++static void enqueue(struct vo *vo, CVPixelBufferRef buf, int64_t pts_ns, bool now)
++{
++    struct priv *p = vo->priv;
++
++    if (p->fmt_desc && !CMVideoFormatDescriptionMatchesImageBuffer(p->fmt_desc, buf))
++        release_fmt_desc(p);
++    if (!p->fmt_desc &&
++        CMVideoFormatDescriptionCreateForImageBuffer(NULL, buf, &p->fmt_desc) != noErr)
++    {
++        MP_ERR(vo, "could not create a format description\n");
++        return;
++    }
++
++    // Host-clock display time: CACurrentMediaTime() plus how far in the future
++    // mpv wants the frame.
++    CFTimeInterval when = CACurrentMediaTime();
++    if (!now && pts_ns > 0)
++        when += (pts_ns - mp_time_ns()) / 1e9;
++    CMSampleTimingInfo timing = {
++        .duration = kCMTimeInvalid,
++        .presentationTimeStamp = CMTimeMakeWithSeconds(when, 1000000000),
++        .decodeTimeStamp = kCMTimeInvalid,
++    };
++    CMSampleBufferRef sample = NULL;
++    if (CMSampleBufferCreateReadyWithImageBuffer(NULL, buf, p->fmt_desc, &timing,
++                                                 &sample) != noErr)
++    {
++        MP_ERR(vo, "could not create a sample buffer\n");
++        return;
++    }
++    if (now) {
++        // Redraws (paused, after a flush) must show at once, not at a time
++        // that may already have passed.
++        CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sample, true);
++        CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
++        CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++    }
++
++    @synchronized(p->layer) {
++        if (p->layer.status != AVQueuedSampleBufferRenderingStatusFailed)
++            [p->layer enqueueSampleBuffer:sample];
++    }
++    CFRelease(sample);
++}
++
++// Render the OSD / subtitles into a BGRA image and hand it to the OSD sublayer,
++// but only when something changed (osd_render's change_id or the size).
++static void update_osd(struct vo *vo, double video_pts)
++{
++    struct priv *p = vo->priv;
++    if (vo->dwidth <= 0 || vo->dheight <= 0)
++        return;
++
++    struct mp_rect src, dst;
++    struct mp_osd_res res;
++    vo_get_src_dst_rects(vo, &src, &dst, &res);
++
++    static const bool formats[SUBBITMAP_COUNT] = {
++        [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
++    };
++    struct sub_bitmap_list *list = osd_render(vo->osd, res, video_pts, 0, formats);
++    if (!list)
++        return;
++    bool same = list->change_id == p->osd_change_id && osd_res_equals(res, p->osd_res);
++    if (same) {
++        talloc_free(list);
++        return;
++    }
++    p->osd_change_id = list->change_id;
++    p->osd_res = res;
++
++    CGImageRef cg = NULL;
++    if (list->num_items) {
++        if (!p->osd_image || p->osd_image->w != res.w || p->osd_image->h != res.h) {
++            talloc_free(p->osd_image);
++            p->osd_image = mp_image_alloc(IMGFMT_BGRA, res.w, res.h);
++        }
++        if (p->osd_image) {
++            mp_image_clear(p->osd_image, 0, 0, res.w, res.h);
++            mp_draw_sub_bitmaps(p->osd_cache, p->osd_image, list);
++            // Copy, since the image is reused for the next update.
++            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++            CGContextRef ctx = CGBitmapContextCreate(
++                p->osd_image->planes[0], res.w, res.h, 8, p->osd_image->stride[0], cs,
++                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
++            if (ctx)
++                cg = CGBitmapContextCreateImage(ctx);
++            CGContextRelease(ctx);
++            CGColorSpaceRelease(cs);
++        }
++    }
++    talloc_free(list);
++
++    bool visible = cg != NULL;
++    if (!visible && !p->osd_visible)
++        return;
++    p->osd_visible = visible;
++    CALayer *osd = p->osd_layer;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES]; // no fade between subtitle lines
++        osd.frame = osd.superlayer.bounds;
++        osd.contents = (__bridge id)cg;
++        [CATransaction commit];
++        if (cg)
++            CGImageRelease(cg);
++    });
++}
++
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    // The VO thread has no autorelease pool of its own; without one, the
++    // NSDictionary/NSNumber temporaries made per frame would leak.
++    @autoreleasepool {
++    struct priv *p = vo->priv;
++    check_resize(vo);
++
++    struct mp_image *img = frame->current;
++    if (img)
++        p->last_pts = img->pts;
++
++    // An exact repeat is already on the layer.
++    if (img && !(frame->repeat && !frame->redraw)) {
++        CVPixelBufferRef buf = NULL;
++        if (img->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++            buf = (CVPixelBufferRef)img->planes[3];
++            CVPixelBufferRetain(buf);
++        } else {
++            buf = upload_sw(vo, img);
++        }
++        if (buf) {
++            attach_common(vo, buf);
++            enqueue(vo, buf, frame->pts, frame->redraw || frame->still || !frame->pts);
++            CVPixelBufferRelease(buf);
++        }
++    }
++
++    update_osd(vo, p->last_pts);
++    }
++    return true;
++}
++
++static void flip_page(struct vo *vo)
++{
++    // Nothing to do: the layer presents each sample at its own time.
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
++    switch (request) {
++    case VOCTRL_CHECK_EVENTS:
++        check_resize(vo);
++        return VO_TRUE;
++    case VOCTRL_RESET: {
++        // Seek: drop frames queued for the old position.
++        struct priv *p = vo->priv;
++        @synchronized(p->layer) {
++            [p->layer flush];
++        }
++        return VO_TRUE;
++    }
++    case VOCTRL_SET_PANSCAN:
++    case VOCTRL_REDRAW:
++        vo->want_redraw = true;
++        return VO_TRUE;
++    }
++    return VO_NOTIMPL;
++}
++
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    // From here on no main-thread callback reaches this VO.
++    [p->observer detach];
++    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
++    release_fmt_desc(p);
++    if (p->pool)
++        CVPixelBufferPoolRelease(p->pool);
++    talloc_free(p->osd_image);
++    if (p->hwctx.av_device_ref) {
++        hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
++        av_buffer_unref(&p->hwctx.av_device_ref);
++    }
++    hwdec_devices_destroy(vo->hwdec_devs);
++    vo->hwdec_devs = NULL;
++
++    // Layer cleanup must happen on the main thread; the block takes over our
++    // references. It runs after preinit's block (same serial queue), so the
++    // KVO registration it removes exists.
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    CALayer *osd = p->osd_layer;
++    AVSBufObserver *observer = p->observer;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [layer removeObserver:observer forKeyPath:@"bounds"];
++        [osd removeFromSuperlayer];
++        [layer flushAndRemoveImage];
++        [osd release];
++        [observer release];
++        [layer release];
++    });
++}
++
++const struct vo_driver video_out_avsbuf = {
++    .description = "AVSampleBufferDisplayLayer (iOS/tvOS, PiP capable)",
++    .name = "avsbuf",
++    .preinit = preinit,
++    .query_format = query_format,
++    .reconfig = reconfig,
++    .control = control,
++    .draw_frame = draw_frame,
++    .flip_page = flip_page,
++    .uninit = uninit,
++    .priv_size = sizeof(struct priv),
++};
