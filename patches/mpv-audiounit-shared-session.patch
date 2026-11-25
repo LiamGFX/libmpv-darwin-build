@@ -1,3 +1,12 @@
+ao_audiounit: share the AVAudioSession between players
+
+The session is process-wide; reference-count it so one player's uninit
+does not deactivate it under another. Adds --audiounit-skip-session-management
+for apps that manage the session themselves. Inherited from the fork,
+ported to 0.41.0 (keeps 0.41's MixWithOthers / AO_INIT_EXCLUSIVE handling).
+
+diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
+index 8d4eb4d..1ae679e 100644
 --- a/audio/out/ao_audiounit.m
 +++ b/audio/out/ao_audiounit.m
 @@ -24,6 +24,8 @@
@@ -9,65 +18,64 @@
  #import <AudioUnit/AudioUnit.h>
  #import <CoreAudio/CoreAudioTypes.h>
  #import <AudioToolbox/AudioToolbox.h>
-@@ -33,8 +35,13 @@
+@@ -33,8 +35,16 @@
  struct priv {
      AudioUnit audio_unit;
      double device_latency;
-+    bool session_acquired;
-+    bool skip_session_management;
++    bool session_acquired;        // this AO holds one reference on the session
++    bool skip_session_management; // --audiounit-skip-session-management
  };
  
++// The AVAudioSession is process-wide, but each mpv player has its own AO.
++// Count the AOs that use it, so one player's uninit doesn't deactivate the
++// session (and silence) another player that is still running.
 +static pthread_mutex_t audiounit_session_lock = PTHREAD_MUTEX_INITIALIZER;
 +static int audiounit_session_use_count;
 +
  static OSStatus au_get_ary(AudioUnit unit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void **data, UInt32 *outDataSize)
  {
      OSStatus err;
-@@ -81,8 +88,60 @@
-     talloc_free(layout);
-     return new_layout;
+@@ -101,6 +111,55 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
+     return noErr;
  }
-+
-+static void acquire_audio_session(struct ao *ao, NSInteger pref_channels)
+ 
++// Configure and activate the shared session on first use only, so a second
++// player doesn't reset a category/mode the first one is playing under.
++static void acquire_audio_session(struct ao *ao,
++                                  AVAudioSessionCategoryOptions options,
++                                  NSInteger pref_channels)
 +{
 +    struct priv *p = ao->priv;
 +    AVAudioSession *instance = AVAudioSession.sharedInstance;
 +
 +    pthread_mutex_lock(&audiounit_session_lock);
-+
 +    if (audiounit_session_use_count == 0) {
-+        [instance setCategory:AVAudioSessionCategoryPlayback
-+                  withOptions:AVAudioSessionCategoryOptionMixWithOthers
-+                        error:nil];
++        [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
 +        [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
 +        [instance setActive:YES error:nil];
-+        [instance setPreferredOutputNumberOfChannels:pref_channels error:nil];
 +    }
-+
++    // The channel count follows the newest stream, as before.
++    [instance setPreferredOutputNumberOfChannels:pref_channels error:nil];
 +    audiounit_session_use_count++;
 +    p->session_acquired = true;
-+
 +    MP_VERBOSE(ao, "audio session users: %d\n", audiounit_session_use_count);
-+
 +    pthread_mutex_unlock(&audiounit_session_lock);
 +}
 +
++// Drop this AO's reference; deactivate only when it was the last user.
 +static void release_audio_session(struct ao *ao)
 +{
 +    struct priv *p = ao->priv;
-+
 +    if (!p->session_acquired)
 +        return;
 +
 +    pthread_mutex_lock(&audiounit_session_lock);
- 
-+    if (audiounit_session_use_count > 0)
++    if (audiounit_session_use_count > 0) {
 +        audiounit_session_use_count--;
-+    else
++    } else {
 +        MP_WARN(ao, "audio session reference count underflow\n");
- 
++    }
 +    p->session_acquired = false;
-+
 +    if (audiounit_session_use_count == 0) {
 +        [AVAudioSession.sharedInstance
 +            setActive:NO
@@ -77,36 +85,35 @@
 +        MP_VERBOSE(ao, "keeping audio session active for %d other user(s)\n",
 +                   audiounit_session_use_count);
 +    }
-+
 +    pthread_mutex_unlock(&audiounit_session_lock);
 +}
 +
- static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
-                               const AudioTimeStamp *ts, UInt32 bus,
-                               UInt32 frames, AudioBufferList *buffer_list)
-@@ -115,10 +174,8 @@
+ static bool init_audiounit(struct ao *ao)
+ {
+     AudioStreamBasicDescription asbd;
+@@ -120,10 +179,9 @@ static bool init_audiounit(struct ao *ao)
+         options |= AVAudioSessionCategoryOptionMixWithOthers;
+     }
  
-     MP_VERBOSE(ao, "max channels: %ld, requested: %d\n", maxChannels, (int)ao->channels.num);
- 
--    [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+-    [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
 -    [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
 -    [instance setActive:YES error:nil];
 -    [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    // The app may own the session itself (skip-session-management).
 +    if (!p->skip_session_management)
-+        acquire_audio_session(ao, prefChannels);
++        acquire_audio_session(ao, options, prefChannels);
  
      AudioComponentDescription desc = (AudioComponentDescription) {
          .componentType         = kAudioUnitType_Output,
-@@ -201,6 +258,8 @@
+@@ -206,6 +264,7 @@ coreaudio_error_audiounit:
  coreaudio_error_component:
      AudioComponentInstanceDispose(p->audio_unit);
  coreaudio_error:
-+    if (!p->skip_session_management)
-+        release_audio_session(ao);
++    release_audio_session(ao);
      talloc_free(layout);
      return false;
  }
-@@ -230,10 +289,8 @@
+@@ -235,10 +294,7 @@ static void uninit(struct ao *ao)
      AudioUnitUninitialize(p->audio_unit);
      AudioComponentInstanceDispose(p->audio_unit);
  
@@ -114,12 +121,11 @@
 -        setActive:NO
 -        withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
 -        error:nil];
-+    if (!p->skip_session_management)
-+        release_audio_session(ao);
++    release_audio_session(ao);
  }
  
  static int init(struct ao *ao)
-@@ -257,4 +314,9 @@
+@@ -262,4 +318,9 @@ const struct ao_driver audio_out_audiounit = {
      .reset          = stop,
      .start          = start,
      .priv_size      = sizeof(struct priv),

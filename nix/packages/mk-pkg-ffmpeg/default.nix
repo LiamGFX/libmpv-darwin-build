@@ -42,9 +42,8 @@ let
     chmod -R 777 $src
 
     cd $src
-    patch -p1 <${../../../patches/ffmpeg-fix-vp9-hwaccel.patch}
-    patch -p1 <${../../../patches/ffmpeg-fix-hls-mp4-seek.patch}
-    patch -p1 <${../../../patches/ffmpeg-fix-ios-hdr-texture.patch}
+    # vp9-hwaccel, hls-mp4-seek and ios-hdr-texture were dropped with the
+    # move to FFmpeg 8.0.3; see patches/README.md.
     patch -p1 <${../../../patches/ffmpeg-fix-dash-base-url-escape.patch}
     cd -
 
