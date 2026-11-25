@@ -12,7 +12,9 @@
 #     templates with them at build time.
 #   - fast_float (header-only): used by src/convert.cc; copied to the path
 #     src/meson.build looks for (3rdparty/fast_float/include).
-# Neither ends up in the shipped binary except fast_float's inlined code
+#   - Vulkan-Headers (header-only, Apache-2.0 / MIT): needed by the Vulkan
+#     stubs even with Vulkan off; nothing from it is linked.
+# None ends up in the shipped binary except fast_float's inlined code
 # (MIT / Apache-2.0 / BSL-1.0, all fine next to LGPL).
 {
   pkgs ? import ../../utils/default/pkgs.nix,
@@ -39,6 +41,11 @@ let
     chmod -R 777 src
     mkdir -p src/3rdparty/fast_float
     cp -r ${pkgs.fast-float}/include src/3rdparty/fast_float/include
+    # Vulkan headers: src/vulkan/stubs.c (built even with -Dvulkan=disabled)
+    # includes <libplacebo/vulkan.h>, which includes <vulkan/vulkan.h>.
+    # src/vulkan/meson.build prefers 3rdparty/Vulkan-Headers/include.
+    mkdir -p src/3rdparty/Vulkan-Headers
+    cp -r ${pkgs.vulkan-headers}/include src/3rdparty/Vulkan-Headers/include
     cp -r src $out
   '';
 
