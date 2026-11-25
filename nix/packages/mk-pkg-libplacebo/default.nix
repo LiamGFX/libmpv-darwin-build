@@ -41,6 +41,16 @@ let
     cp -r ${pkgs.fast-float}/include src/3rdparty/fast_float/include
     cp -r src $out
   '';
+
+  # Python with jinja2/markupsafe for the GLSL preprocessor. libplacebo's
+  # meson.build runs it with import('python').find_installation(), which is
+  # the Python meson itself runs on (nixpkgs' meson wrapper), not one from
+  # nativeBuildInputs, so the modules are handed over via PYTHONPATH
+  # (meson's python_env appends to the inherited PYTHONPATH).
+  pythonEnv = pkgs.python3.withPackages (ps: [
+    ps.jinja2
+    ps.markupsafe
+  ]);
 in
 
 pkgs.stdenvNoCC.mkDerivation {
@@ -54,10 +64,7 @@ pkgs.stdenvNoCC.mkDerivation {
     pkgs.meson
     pkgs.ninja
     pkgs.pkg-config
-    (pkgs.python3.withPackages (ps: [
-      ps.jinja2
-      ps.markupsafe
-    ]))
+    pythonEnv
   ];
   configurePhase = ''
     meson setup build $src \
@@ -82,6 +89,7 @@ pkgs.stdenvNoCC.mkDerivation {
       -Dfuzz=false
   '';
   buildPhase = ''
+    export PYTHONPATH=${pythonEnv}/${pkgs.python3.sitePackages}
     meson compile -vC build
   '';
   installPhase = ''
