@@ -7,10 +7,10 @@ in the background, where the OpenGL ES render API cannot run. See the
 header of video/out/vo_avsbuf.m for the design. LGPL-2.1+.
 
 diff --git a/meson.build b/meson.build
-index 8c9e233..24b5e41 100644
+index fb10be5..d2e6042 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -818,6 +818,20 @@ if features['audiounit']
+@@ -815,6 +815,20 @@ if features['audiounit']
      sources += files('audio/out/ao_audiounit.m')
  endif
  
@@ -19,7 +19,7 @@ index 8c9e233..24b5e41 100644
 +avsbuf_opt = get_option('avsbuf').require(darwin)
 +avsbuf = dependency('appleframeworks',
 +                    modules: ['Foundation', 'UIKit', 'QuartzCore', 'AVFoundation',
-+                              'CoreMedia', 'CoreVideo'],
++                              'CoreMedia', 'CoreVideo', 'VideoToolbox'],
 +                    required: avsbuf_opt)
 +features += {'avsbuf': avsbuf.found()}
 +if features['avsbuf']
@@ -69,10 +69,10 @@ index c9cde30..f8f856c 100644
      // should not be auto-selected
 diff --git a/video/out/vo_avsbuf.m b/video/out/vo_avsbuf.m
 new file mode 100644
-index 0000000..9c220e4
+index 0000000..0f3a176
 --- /dev/null
 +++ b/video/out/vo_avsbuf.m
-@@ -0,0 +1,629 @@
+@@ -0,0 +1,746 @@
 +/*
 + * avsbuf video output: shows frames on an AVSampleBufferDisplayLayer
 + * (iOS / tvOS), written for SuperViewer.
@@ -101,8 +101,15 @@ index 0000000..9c220e4
 + *   only when the OSD actually changed; video frames are never re-rendered.
 + * - Software-decoded frames (NV12 / P010) are copied into IOSurface-backed
 + *   CVPixelBuffers from a pool; mpv converts any other format to these.
-+ *
-+ * Not handled yet: video rotation metadata (frames show unrotated).
++ * - Rotation (e.g. phone videos): the VO declares VO_CAP_ROTATE90, so mpv
++ *   leaves params.rotate to us instead of inserting its software rotate
++ *   filter (which can't take VideoToolbox frames). Each frame is rotated by
++ *   VTPixelRotationSession into a second pooled IOSurface buffer, GPU side
++ *   and format-preserving (10-bit stays 10-bit), so PiP, which shows the
++ *   layer's samples and ignores layer transforms, gets upright video too.
++ *   Same approach as VLC's VLCSampleBufferDisplay.m (LGPL-2.1+).
++ *   VTPixelRotationSession needs iOS / tvOS 16; on iOS 15 frames show
++ *   unrotated (logged once).
 + *
 + * This file is part of mpv.
 + *
@@ -125,6 +132,7 @@ index 0000000..9c220e4
 +#import <CoreVideo/CoreVideo.h>
 +#import <QuartzCore/QuartzCore.h>
 +#import <UIKit/UIKit.h>
++#import <VideoToolbox/VideoToolbox.h>
 +
 +#include <stdatomic.h>
 +
@@ -204,6 +212,14 @@ index 0000000..9c220e4
 +    CMVideoFormatDescriptionRef fmt_desc; // cached, rebuilt when it stops matching
 +    CVPixelBufferPoolRef pool;          // for software frames
 +    int pool_fmt, pool_w, pool_h;
++
++    // Rotation (VO thread): session and destination pool, made on first use.
++    VTPixelRotationSessionRef rot_session;
++    int rot_session_angle;              // rotation the session is set to
++    CVPixelBufferPoolRef rot_pool;
++    OSType rot_pool_fmt;
++    int rot_pool_w, rot_pool_h;
++    bool rot_warned;                    // "can't rotate" logged once
 +
 +    // Layer size in pixels, written on the main thread (KVO on bounds) and
 +    // read on the VO thread.
@@ -386,13 +402,16 @@ index 0000000..9c220e4
 +// scales anamorphic video right and tone-maps HDR with the stream's values.
 +// The byte layouts are the big-endian SEI/box layouts CoreVideo expects
 +// (same as VLC's attachHDRMetadataFromFormat).
-+static void attach_common(struct vo *vo, CVPixelBufferRef buf)
++static void attach_common(struct vo *vo, CVPixelBufferRef buf, bool rotated90)
 +{
 +    struct priv *p = vo->priv;
 +    if (p->params.p_w > 0 && p->params.p_h > 0) {
++        // A 90/270 rotation turns the pixel shape too (p_w:p_h -> p_h:p_w).
++        int horiz = rotated90 ? p->params.p_h : p->params.p_w;
++        int vert = rotated90 ? p->params.p_w : p->params.p_h;
 +        NSDictionary *par = @{
-+            (__bridge NSString *)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(p->params.p_w),
-+            (__bridge NSString *)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(p->params.p_h),
++            (__bridge NSString *)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(horiz),
++            (__bridge NSString *)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(vert),
 +        };
 +        CVBufferSetAttachment(buf, kCVImageBufferPixelAspectRatioKey,
 +                              (__bridge CFDictionaryRef)par,
@@ -486,6 +505,96 @@ index 0000000..9c220e4
 +    CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,
 +                          cv_transfer(p->params.color.transfer), kCVAttachmentMode_ShouldPropagate);
 +    return buf;
++}
++
++static void release_rotation(struct priv *p)
++{
++    if (p->rot_session) {
++        VTPixelRotationSessionInvalidate(p->rot_session);
++        CFRelease(p->rot_session);
++    }
++    p->rot_session = NULL;
++    if (p->rot_pool)
++        CVPixelBufferPoolRelease(p->rot_pool);
++    p->rot_pool = NULL;
++}
++
++// Rotate `src` clockwise by params.rotate (a multiple of 90; mpv only hands
++// those to a VO_CAP_ROTATE90 VO). Returns a new +1 buffer, or NULL to show
++// `src` as it is (no rotation, unsupported OS, or an error, which is logged).
++static CVPixelBufferRef rotate_buffer(struct vo *vo, CVPixelBufferRef src)
++{
++    struct priv *p = vo->priv;
++    int angle = p->params.rotate % 360;
++    if (angle == 0)
++        return NULL;
++
++    if (@available(iOS 16.0, tvOS 16.0, *)) {
++        if (!p->rot_session || p->rot_session_angle != angle) {
++            release_rotation(p);
++            if (VTPixelRotationSessionCreate(NULL, &p->rot_session) != noErr) {
++                p->rot_session = NULL;
++                MP_ERR(vo, "could not create a pixel rotation session\n");
++                return NULL;
++            }
++            // mpv's rotate is clockwise, like kVTRotation_CW90.
++            CFStringRef rot = angle == 90  ? kVTRotation_CW90 :
++                              angle == 180 ? kVTRotation_180 :
++                                             kVTRotation_CCW90;
++            VTSessionSetProperty(p->rot_session, kVTPixelRotationPropertyKey_Rotation, rot);
++            p->rot_session_angle = angle;
++        }
++
++        // Destination: same pixel format, width/height swapped for 90/270.
++        OSType fmt = CVPixelBufferGetPixelFormatType(src);
++        int w = (int)CVPixelBufferGetWidth(src), h = (int)CVPixelBufferGetHeight(src);
++        if (angle != 180) {
++            int t = w; w = h; h = t;
++        }
++        if (!p->rot_pool || p->rot_pool_fmt != fmt || p->rot_pool_w != w ||
++            p->rot_pool_h != h)
++        {
++            if (p->rot_pool)
++                CVPixelBufferPoolRelease(p->rot_pool);
++            p->rot_pool = NULL;
++            NSDictionary *attrs = @{
++                (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(fmt),
++                (__bridge NSString *)kCVPixelBufferWidthKey: @(w),
++                (__bridge NSString *)kCVPixelBufferHeightKey: @(h),
++                (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
++            };
++            if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attrs,
++                                        &p->rot_pool) != kCVReturnSuccess)
++            {
++                p->rot_pool = NULL;
++                MP_ERR(vo, "could not create a rotation pixel buffer pool\n");
++                return NULL;
++            }
++            p->rot_pool_fmt = fmt;
++            p->rot_pool_w = w;
++            p->rot_pool_h = h;
++        }
++
++        CVPixelBufferRef dst = NULL;
++        if (CVPixelBufferPoolCreatePixelBuffer(NULL, p->rot_pool, &dst) != kCVReturnSuccess)
++            return NULL;
++        OSStatus err = VTPixelRotationSessionRotateImage(p->rot_session, src, dst);
++        if (err != noErr) {
++            MP_ERR(vo, "pixel rotation failed (%d)\n", (int)err);
++            CVPixelBufferRelease(dst);
++            return NULL;
++        }
++        // Colour attachments (matrix, primaries, transfer) from the source;
++        // attach_common() then adds the rotated PAR and HDR metadata.
++        CVBufferPropagateAttachments(src, dst);
++        return dst;
++    }
++
++    if (!p->rot_warned) {
++        MP_WARN(vo, "video rotation needs iOS 16; showing it unrotated\n");
++        p->rot_warned = true;
++    }
++    return NULL;
 +}
 +
 +static void enqueue(struct vo *vo, CVPixelBufferRef buf, int64_t pts_ns, bool now)
@@ -618,8 +727,13 @@ index 0000000..9c220e4
 +        } else {
 +            buf = upload_sw(vo, img);
 +        }
++        CVPixelBufferRef rotated = buf ? rotate_buffer(vo, buf) : NULL;
++        if (rotated) {
++            CVPixelBufferRelease(buf);
++            buf = rotated;
++        }
 +        if (buf) {
-+            attach_common(vo, buf);
++            attach_common(vo, buf, rotated && p->params.rotate % 180);
 +            enqueue(vo, buf, frame->pts, frame->redraw || frame->still || !frame->pts);
 +            CVPixelBufferRelease(buf);
 +        }
@@ -666,6 +780,7 @@ index 0000000..9c220e4
 +    release_fmt_desc(p);
 +    if (p->pool)
 +        CVPixelBufferPoolRelease(p->pool);
++    release_rotation(p);
 +    talloc_free(p->osd_image);
 +    if (p->hwctx.av_device_ref) {
 +        hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
@@ -693,6 +808,8 @@ index 0000000..9c220e4
 +const struct vo_driver video_out_avsbuf = {
 +    .description = "AVSampleBufferDisplayLayer (iOS/tvOS, PiP capable)",
 +    .name = "avsbuf",
++    // We rotate frames ourselves (rotate_buffer), see the notes at the top.
++    .caps = VO_CAP_ROTATE90,
 +    .preinit = preinit,
 +    .query_format = query_format,
 +    .reconfig = reconfig,
